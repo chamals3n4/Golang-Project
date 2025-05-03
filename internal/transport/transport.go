@@ -3,59 +3,76 @@ package transport
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
-	"time"
+
+	"mini_etcd/config"
 )
 
-type RPC string // RPC identifies the Raft method.
+type RPC string
 
 const (
-	RPCRequestVote   RPC = "request_vote"
-	RPCAppendEntries RPC = "append_entries"
+	RPCRequestVote   RPC = "RequestVote"
+	RPCAppendEntries RPC = "AppendEntries"
 )
 
-// HandlerFunc handles an inbound RPC and returns response or error.
-type HandlerFunc func(method RPC, body io.Reader, w http.ResponseWriter)
+type Handler func(method RPC, body io.Reader, w http.ResponseWriter)
 
-// HTTPTransport routes JSON‑encoded RPCs over http.Client.
 type HTTPTransport struct {
+	handler Handler
 	client  *http.Client
-	handler HandlerFunc
 }
 
-func New(handler HandlerFunc) *HTTPTransport {
+func New(handler Handler) *HTTPTransport {
 	return &HTTPTransport{
-		client:  &http.Client{Timeout: 3 * time.Second},
 		handler: handler,
+		client: &http.Client{
+			Timeout: config.RPCTimeout,
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: config.RPCTimeout,
+				IdleConnTimeout:      config.RPCTimeout * 2,
+				MaxIdleConnsPerHost: 100,
+			},
+		},
 	}
 }
 
 func (t *HTTPTransport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	t.handler(RPC(r.URL.Path[1:]), r.Body, w)
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	method := RPC(r.URL.Path[1:])
+	t.handler(method, r.Body, w)
 }
 
-func (t *HTTPTransport) Call(addr string, method RPC, req, resp any) error {
-	buf, _ := json.Marshal(req)
-	httpResp, err := t.client.Post(
-		"http://"+addr+"/"+string(method),
-		"application/json",
-		bytes.NewReader(buf))
+func (t *HTTPTransport) Call(addr string, method RPC, args interface{}, reply interface{}) error {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(args); err != nil {
+		return fmt.Errorf("encode: %v", err)
+	}
 
+	url := fmt.Sprintf("http://%s/%s", addr, string(method))
+	resp, err := t.client.Post(url, "application/json", &buf)
 	if err != nil {
-		return err
+		return fmt.Errorf("post: %v", err)
 	}
-	defer httpResp.Body.Close()
+	defer resp.Body.Close()
 
-	if httpResp.StatusCode != http.StatusOK {
-		return io.ErrUnexpectedEOF
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status: %s", resp.Status)
 	}
 
-	return json.NewDecoder(httpResp.Body).Decode(resp)
+	if err := json.NewDecoder(resp.Body).Decode(reply); err != nil {
+		return fmt.Errorf("decode: %v", err)
+	}
+	return nil
 }
 
 // Utility to reply JSON.
-func ReplyJSON(w http.ResponseWriter, v any) {
+func ReplyJSON(w http.ResponseWriter, v interface{}) {
 	data, _ := json.Marshal(v)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

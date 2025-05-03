@@ -16,40 +16,83 @@ type GetCmd struct{ Key string }
 type Store struct {
 	db  *bolt.DB
 	lru *lruCache
+	mu  sync.RWMutex
 }
 
 func New(db *bolt.DB, maxEntries int) *Store {
-	_ = db.Update(func(tx *bolt.Tx) error {
-		_ = tx.DeleteBucket([]byte("kv"))
-		_, _ = tx.CreateBucket([]byte("kv"))
-		return nil
+	err := db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte("kv"))
+		return err
 	})
+	if err != nil {
+		panic(err)
+	}
 	return &Store{db: db, lru: newLRU(maxEntries)}
 }
 
-func (s *Store) Close() { _ = s.db.Close() }
+func (s *Store) Close() error {
+	return s.db.Close()
+}
 
 /* ─────────────────── API ───────────────────────── */
 
 func (s *Store) Get(key string) string {
+	// Try cache first
 	if v, ok := s.lru.get(key); ok {
 		return v
 	}
-	return ""
+
+	// Cache miss, check database
+	var value string
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("kv"))
+		if b == nil {
+			return nil
+		}
+		v := b.Get([]byte(key))
+		if v != nil {
+			value = string(v)
+		}
+		return nil
+	})
+	if err != nil {
+		return ""
+	}
+
+	// Update cache if found in database
+	if value != "" {
+		s.lru.add(key, value)
+	}
+	return value
 }
 
 func (s *Store) Apply(cmd any) any {
 	switch c := cmd.(type) {
-
 	case SetCmd:
-		_ = s.db.Update(func(tx *bolt.Tx) error {
-			return tx.Bucket([]byte("kv")).Put([]byte(c.Key), []byte(c.Value))
+		err := s.db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte("kv"))
+			if b == nil {
+				return nil
+			}
+			return b.Put([]byte(c.Key), []byte(c.Value))
 		})
+		if err != nil {
+			return err
+		}
+		s.lru.add(c.Key, c.Value)
 
 	case DelCmd:
-		_ = s.db.Update(func(tx *bolt.Tx) error {
-			return tx.Bucket([]byte("kv")).Delete([]byte(c.Key))
+		err := s.db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte("kv"))
+			if b == nil {
+				return nil
+			}
+			return b.Delete([]byte(c.Key))
 		})
+		if err != nil {
+			return err
+		}
+		s.lru.remove(c.Key)
 
 	case GetCmd:
 		return s.Get(c.Key)
@@ -78,6 +121,7 @@ func (c *lruCache) get(k string) (string, bool) {
 	if !ok {
 		return "", false
 	}
+	c.ll.MoveToFront(e)
 	return e.Value.(*entry).value, true
 }
 
@@ -86,12 +130,13 @@ func (c *lruCache) add(k, v string) {
 	defer c.mu.Unlock()
 
 	if e, ok := c.tab[k]; ok {
+		c.ll.MoveToFront(e)
 		e.Value.(*entry).value = v
 		return
 	}
-	e := c.ll.PushBack(&entry{k, v})
+	e := c.ll.PushFront(&entry{k, v})
 	c.tab[k] = e
-	if c.ll.Len() >= c.cap {
+	if c.ll.Len() > c.cap {
 		tail := c.ll.Back()
 		c.ll.Remove(tail)
 		delete(c.tab, tail.Value.(*entry).key)

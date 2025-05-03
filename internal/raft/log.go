@@ -3,13 +3,14 @@ package raft
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/gob"
+	"encoding/json"
 	"sync"
 
 	bolt "go.etcd.io/bbolt"
 )
 
 type LogEntry struct {
+	Index   int
 	Term    int
 	Command any
 }
@@ -67,8 +68,9 @@ func (l *boltLog) Append(entries ...LogEntry) int {
 		b := tx.Bucket([]byte("log"))
 		for _, e := range entries {
 			last = uint64(l.LastIndex() + 1)
+			e.Index = int(last)
 			var buf bytes.Buffer
-			_ = gob.NewEncoder(&buf).Encode(e)
+			_ = json.NewEncoder(&buf).Encode(e)
 			_ = b.Put(u64ToKey(last), buf.Bytes())
 		}
 		return nil
@@ -86,7 +88,7 @@ func (l *boltLog) At(idx int) (LogEntry, bool) {
 		if v == nil {
 			return nil
 		}
-		_ = gob.NewDecoder(bytes.NewReader(v)).Decode(&e)
+		_ = json.NewDecoder(bytes.NewReader(v)).Decode(&e)
 		return nil
 	})
 	return e, e.Term != 0 || e.Command != nil
@@ -103,7 +105,7 @@ func (l *boltLog) LastIndexTerm() (int, int) {
 		}
 		idx = int(keyToU64(k))
 		var e LogEntry
-		_ = gob.NewDecoder(bytes.NewReader(v)).Decode(&e)
+		_ = json.NewDecoder(bytes.NewReader(v)).Decode(&e)
 		term = e.Term
 		return nil
 	})
@@ -125,12 +127,25 @@ func (l *boltLog) TruncateBefore(index int) {
 	defer l.mu.Unlock()
 
 	_ = l.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("log"))
-		c := b.Cursor()
-		for k, _ := c.First(); k != nil && keyToU64(k) < uint64(index); k, _ = c.Next() {
-			_ = c.Delete()
+		logBucket := tx.Bucket([]byte("log"))
+		metaBucket := tx.Bucket([]byte("meta"))
+		
+		// Update base index in metadata
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(index))
+		if err := metaBucket.Put([]byte("firstIndex"), b[:]); err != nil {
+			return err
 		}
-
+		
+		// Delete all entries before the new base index
+		c := logBucket.Cursor()
+		for k, _ := c.First(); k != nil && keyToU64(k) < uint64(index); k, _ = c.Next() {
+			if err := c.Delete(); err != nil {
+				return err
+			}
+		}
+		
+		l.base = uint64(index)
 		return nil
 	})
 }
@@ -138,14 +153,29 @@ func (l *boltLog) TruncateBefore(index int) {
 func (l *boltLog) TruncateSuffix(idx int) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	
 	return l.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("log"))
 		c := b.Cursor()
+		
+		// Delete all entries from idx onwards
 		for k, _ := c.Seek(u64ToKey(uint64(idx))); k != nil; k, _ = c.Next() {
 			if err := c.Delete(); err != nil {
 				return err
 			}
 		}
+		
+		// If we truncated everything, reset base index
+		if first, _ := c.First(); first == nil {
+			metaBucket := tx.Bucket([]byte("meta"))
+			var b [8]byte
+			binary.BigEndian.PutUint64(b[:], 1)
+			if err := metaBucket.Put([]byte("firstIndex"), b[:]); err != nil {
+				return err
+			}
+			l.base = 1
+		}
+		
 		return nil
 	})
 }
